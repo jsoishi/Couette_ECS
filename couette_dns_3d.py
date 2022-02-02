@@ -56,13 +56,16 @@ z = zbasis.local_grid(1)
 integ = lambda A: d3.Integrate(d3.Integrate(d3.Integrate(A, 'x'),'y'), 'z')
 
 # Fields
-p = dist.Field(name='p', bases=(xbasis,zbasis))
-u = dist.VectorField(coords, name='u', bases=(xbasis,zbasis))
-tau1u = dist.VectorField(coords, name='tau1u', bases=xbasis)
-tau2u = dist.VectorField(coords, name='tau2u', bases=xbasis)
+ba = (xbasis,ybasis,zbasis)
+ba_p = (xbasis,ybasis)
+
+p = dist.Field(name='p', bases=ba)
+u = dist.VectorField(coords, name='u', bases=ba)
+tau1u = dist.VectorField(coords, name='tau1u', bases=ba_p)
+tau2u = dist.VectorField(coords, name='tau2u', bases=ba_p)
 
 # NCC
-U = dist.VectorField(coords, name='U', bases=(xbasis,zbasis))
+U = dist.VectorField(coords, name='U', bases=(xbasis,ybasis,zbasis))
 U['g'][0] = z
 
 ex = dist.VectorField(coords, name='ex')
@@ -74,7 +77,7 @@ ez['g'][2] = 1
 
 lift_basis = zbasis.clone_with(a=1/2, b=1/2) # First derivative basis
 lift = lambda A, n: d3.LiftTau(A, lift_basis, n)
-grad_u = d3.grad(u) + ez*lift(tau1u,-1) # First-order reduction
+#grad_u = d3.grad(u) + ez*lift(tau1u,-1) # First-order reduction
 
 if dist.comm.rank == 0:
     if not datadir.exists():
@@ -82,15 +85,15 @@ if dist.comm.rank == 0:
 
 problem = d3.IVP([p, u, tau1u, tau2u], namespace=locals())
 
-problem.add_equation("trace(grad_u) = 0")
-problem.add_equation("dt(u) + grad(p) - (1/Re)*div(grad_u) + lift(tau2u,-1) = -dot(u,grad(u))")
+problem.add_equation("div(u) + dot(lift(tau2u,-1),ez) = 0")
+problem.add_equation("dt(u) - lap(u)/Re + grad(p) + lift(tau2u,-2) + lift(tau1u,-1) = -dot(u,grad(u))")
 problem.add_equation("dot(ex,u)(z=-1) = -1")
 problem.add_equation("dot(ex,u)(z=1) = 1")
 problem.add_equation("dot(ey,u)(z=-1) = 0")
 problem.add_equation("dot(ey,u)(z=1) = 0")
 problem.add_equation("dot(ez,u)(z=-1) = 0")
-problem.add_equation("dot(ez,u)(z=1) = 0", condition="nx != 0")
-problem.add_equation("p(z=1) = 0", condition="nx == 0") # Pressure gauge
+problem.add_equation("dot(ez,u)(z=1) = 0", condition="nx != 0 or ny != 0")
+problem.add_equation("p(z=1) = 0", condition="nx == 0 and ny == 0") # Pressure gauge
 
 solver = problem.build_solver(timestepper)
 logger.info("Solver built")
@@ -100,12 +103,13 @@ solver.stop_wall_time = stop_wall_time
 solver.stop_iteration = stop_iteration
 
 # Initial conditions
-psi = dist.Field(name='psi', bases=(xbasis,zbasis))
-psi.fill_random('g', seed=42, distribution='normal')
-psi.low_pass_filter(scales=(0.5,0.5))
-psi['g'] *= Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) # Damp noise at walls
+A = dist.VectorField(coords, name='A', bases=ba)
+A.fill_random('g', seed=42, distribution='normal')
+A.low_pass_filter(scales=(0.5, 0.5, 0.5))
+A['g'] *= Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) # Damp noise at walls
 
-up = d3.skew(d3.grad(psi)).evaluate()
+# no curl...don't worry about div(u) for now...
+up = A #d3.curl(A).evaluate()
 up.set_scales(1, keep_data=True)
 u['g'] = 1e-3*up['g'] + U['g']
 
@@ -121,14 +125,14 @@ check.add_tasks(solver.state)
 
 timeseries = solver.evaluator.add_file_handler(datadir / Path('timeseries'), iter=100)
 timeseries.add_task(integ(KE), name='KE')
-#timeseries.add_task(integ(KE_pert), name = 'KE_pert')
+timeseries.add_task(integ(KE_pert), name = 'KE_pert')
 
 
 
 flow = d3.GlobalFlowProperty(solver, cadence=100)
 flow.add_property(KE, name='KE')
-flow.add_property(d3.trace(grad_u), name='div_u')
-#flow.add_property(KE_pert, name = 'KE_pert')
+flow.add_property(d3.div(u), name='div_u')
+flow.add_property(KE_pert, name = 'KE_pert')
 
 # Main loop
 end_init_time = time.time()
@@ -143,7 +147,7 @@ try:
         if (solver.iteration-1) % 100 == 0:
             logger.info('Iteration: %i, Time: %e, dt: %e' %(solver.iteration, solver.sim_time, sim_dt))
             logger.info('Max KE = %e; Max div(u) = %e' %(flow.max('KE'), flow.max('div_u')))
-            #logger.info('Max KE_pert = %e' %flow.max('KE_pert'))
+            logger.info('Max perturbation KE = %e' %flow.max('KE_pert'))
 except:
     logger.error('Exception raised, triggering end of main loop.')
     raise
