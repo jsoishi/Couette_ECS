@@ -45,7 +45,7 @@ dealias = 3/2
 dtype = np.float64
 
 coords = d3.CartesianCoordinates('x', 'y', 'z')
-dist = d3.Distributor(coords, dtype=dtype)
+dist = d3.Distributor(coords, dtype=dtype, mesh=[8,16])
 xbasis = d3.RealFourier(coords['x'], size=nx, bounds=(0, Lx), dealias = dealias)
 ybasis = d3.RealFourier(coords['y'], size=ny, bounds=(0, Ly), dealias = dealias)
 zbasis = d3.ChebyshevT(coords['z'], size=nz, bounds = (-1,1), dealias = dealias)
@@ -110,26 +110,34 @@ A['g'] *= Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) # Damp noise at walls
 
 up = d3.curl(A).evaluate()
 up.change_scales(1)
-u['g'] = 1e-3*up['g'] + U['g']
+#u['g'] = ampl*up['g']*Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) + U['g']
+u['g'] = ampl*up['g'] + U['g']
 
 KE = 0.5 * d3.DotProduct(u,u)
 KE.name = 'KE'
 u_pert = u - U
 KE_pert = 0.5 * d3.DotProduct(u_pert,u_pert)
 
-check = solver.evaluator.add_file_handler(datadir / Path('checkpoints'), iter=1000, max_writes=1, virtual_file=True)
+check = solver.evaluator.add_file_handler(datadir / Path('checkpoints'), iter=10, max_writes=1, virtual_file=True)
 check.add_tasks(solver.state)
 check_c = solver.evaluator.add_file_handler(datadir / Path('checkpoints_c'),iter=1000,max_writes=100)
 check_c.add_tasks(solver.state, layout='c')
 
-timeseries = solver.evaluator.add_file_handler(datadir / Path('timeseries'), iter=100)
+timeseries = solver.evaluator.add_file_handler(datadir / Path('timeseries'), iter=10)
 timeseries.add_task(integ(KE), name='KE')
 timeseries.add_task(integ(KE_pert), name = 'KE_pert')
+timeseries.add_task(integ(d3.div(u)*d3.div(u)), name='rms_div_u')
 
-flow = d3.GlobalFlowProperty(solver, cadence=100)
+flow = d3.GlobalFlowProperty(solver, cadence=10)
 flow.add_property(KE, name='KE')
 flow.add_property(d3.div(u), name='div_u')
+flow.add_property(d3.div(u)**2, name='div_u_sq')
 flow.add_property(KE_pert, name = 'KE_pert')
+
+# CFL
+CFL = d3.CFL(solver, initial_dt=1e-5, cadence=10, safety=0.2, threshold=0.1,
+             max_change=1.5, min_change=0.5, max_dt=sim_dt)
+CFL.add_velocity(u)
 
 # Main loop
 end_init_time = time.time()
@@ -139,11 +147,12 @@ try:
     logger.info('Starting loop')
     start_run_time = time.time()
     while solver.proceed:
-        #dt = CFL.compute_dt()
-        solver.step(sim_dt)
+        dt = CFL.compute_timestep()
+        solver.step(dt)
         if (solver.iteration-1) % 10 == 0:
-            logger.info('Iteration: %i, Time: %e, dt: %e' %(solver.iteration, solver.sim_time, sim_dt))
+            logger.info('Iteration: %i, Time: %e, dt: %e' %(solver.iteration, solver.sim_time, dt))
             logger.info('Max KE = %e; Max div(u) = %e' %(flow.max('KE'), flow.max('div_u')))
+            logger.info('Vol RMS div(u) = %e'%flow.volume_integral('div_u_sq'))
             logger.info('Max perturbation KE = %e' %flow.max('KE_pert'))
 except:
     logger.error('Exception raised, triggering end of main loop.')
