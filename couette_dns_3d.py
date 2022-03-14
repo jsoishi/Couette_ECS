@@ -45,13 +45,13 @@ dealias = 3/2
 dtype = np.float64
 
 coords = d3.CartesianCoordinates('x', 'y', 'z')
-dist = d3.Distributor(coords, dtype=dtype, mesh=[8,16])
+dist = d3.Distributor(coords, dtype=dtype, mesh=[4,4])
 xbasis = d3.RealFourier(coords['x'], size=nx, bounds=(0, Lx), dealias = dealias)
 ybasis = d3.RealFourier(coords['y'], size=ny, bounds=(0, Ly), dealias = dealias)
 zbasis = d3.ChebyshevT(coords['z'], size=nz, bounds = (-1,1), dealias = dealias)
-x = xbasis.local_grid(1)
-y = xbasis.local_grid(1)
-z = zbasis.local_grid(1)
+x = xbasis.local_grid(dealias)
+y = xbasis.local_grid(dealias)
+z = zbasis.local_grid(dealias)
 
 integ = lambda A: d3.Integrate(d3.Integrate(d3.Integrate(A, 'x'),'y'), 'z')
 
@@ -61,11 +61,12 @@ ba_p = (xbasis,ybasis)
 
 p = dist.Field(name='p', bases=ba)
 u = dist.VectorField(coords, name='u', bases=ba)
-tau1u = dist.VectorField(coords, name='tau1u', bases=ba_p)
-tau2u = dist.VectorField(coords, name='tau2u', bases=ba_p)
-
+tau_u1 = dist.VectorField(coords, name='tau_u1', bases=ba_p)
+tau_u2 = dist.VectorField(coords, name='tau_u2', bases=ba_p)
+tau_p = dist.Field(name='tau_p')
 # NCC
 U = dist.VectorField(coords, name='U', bases=(xbasis,ybasis,zbasis))
+U.change_scales(dealias)
 U['g'][0] = z
 
 ex = dist.VectorField(coords, name='ex')
@@ -76,24 +77,24 @@ ey['g'][1] = 1
 ez['g'][2] = 1
 
 lift_basis = zbasis.clone_with(a=1/2, b=1/2) # First derivative basis
-lift = lambda A, n: d3.LiftTau(A, lift_basis, n)
-#grad_u = d3.grad(u) + ez*lift(tau1u,-1) # First-order reduction
+lift = lambda A: d3.Lift(A, lift_basis, -1)
+grad_u = d3.grad(u) + ez*lift(tau_u1) # First-order reduction
 
 if dist.comm.rank == 0:
     if not datadir.exists():
         datadir.mkdir()
 
-problem = d3.IVP([p, u, tau1u, tau2u], namespace=locals())
+problem = d3.IVP([p, u, tau_u1, tau_u2, tau_p], namespace=locals())
 
-problem.add_equation("div(u) + dot(lift(tau2u,-1),ez) = 0")
-problem.add_equation("dt(u) - lap(u)/Re + grad(p) + lift(tau2u,-2) + lift(tau1u,-1) = -dot(u,grad(u))")
+problem.add_equation("trace(grad_u) + tau_p = 0")
+problem.add_equation("dt(u) - div(grad_u)/Re + grad(p) + lift(tau_u2) = -dot(u,grad(u))")
 problem.add_equation("dot(ex,u)(z=-1) = -1")
 problem.add_equation("dot(ex,u)(z=1) = 1")
 problem.add_equation("dot(ey,u)(z=-1) = 0")
 problem.add_equation("dot(ey,u)(z=1) = 0")
 problem.add_equation("dot(ez,u)(z=-1) = 0")
-problem.add_equation("dot(ez,u)(z=1) = 0", condition="nx != 0 or ny != 0")
-problem.add_equation("p(z=1) = 0", condition="nx == 0 and ny == 0") # Pressure gauge
+problem.add_equation("dot(ez,u)(z=1) = 0")
+problem.add_equation("integ(p) = 0") # Pressure gauge
 
 solver = problem.build_solver(timestepper)
 logger.info("Solver built")
@@ -104,14 +105,17 @@ solver.stop_iteration = stop_iteration
 
 # Initial conditions
 A = dist.VectorField(coords, name='A', bases=ba)
+A.change_scales(dealias)
 A.fill_random('g', seed=42, distribution='normal')
 A.low_pass_filter(scales=(0.5, 0.5, 0.5))
-A['g'] *= Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) # Damp noise at walls
+A['g'] *= (Lz**2*(z+1)/Lz * (1 - (z+1)/Lz))**2 # Damp noise at walls
 
 up = d3.curl(A).evaluate()
-up.change_scales(1)
-#u['g'] = ampl*up['g']*Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) + U['g']
+u.change_scales(dealias)
+# u['g'] = ampl*up['g']*Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) + U['g']
 u['g'] = ampl*up['g'] + U['g']
+divu0 = d3.div(u).evaluate()
+logger.info("min, max divu = ({}, {})".format(divu0['g'].min(), divu0['g'].max()))
 
 KE = 0.5 * d3.DotProduct(u,u)
 KE.name = 'KE'
@@ -154,10 +158,11 @@ try:
             logger.info('Max KE = %e; Max div(u) = %e' %(flow.max('KE'), flow.max('div_u')))
             logger.info('Vol RMS div(u) = %e'%flow.volume_integral('div_u_sq'))
             logger.info('Max perturbation KE = %e' %flow.max('KE_pert'))
+            
+
 except:
     logger.error('Exception raised, triggering end of main loop.')
     raise
-
 finally:
     end_run_time = time.time()
 
