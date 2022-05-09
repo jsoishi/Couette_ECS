@@ -1,0 +1,164 @@
+import time
+from configparser import ConfigParser
+from pathlib import Path
+import sys
+import logging
+import numpy as np
+
+import dedalus.public as d3
+
+logger = logging.getLogger(__name__)
+debug = False
+
+# Parsing .cfg passed
+config_file = Path(sys.argv[-1])
+logger.info("Running with config file {}".format(str(config_file)))
+
+# Setting global params
+runconfig = ConfigParser()
+runconfig.read(str(config_file))
+datadir = Path("couette_runs") / config_file.stem
+
+# Params
+timestepper = d3.RK222
+params = runconfig['params']
+nx = params.getint('nx')
+ny = params.getint('ny')
+nz = params.getint('nz')
+Lx = params.getfloat('Lx')
+Ly = params.getfloat('Ly')
+Lz = 2 # fixed by problem definition
+
+ampl = params.getfloat('ampl')
+Re = params.getfloat('Re')
+Ro = params.getfloat('Ro')
+
+run_params = runconfig['run']
+restart = run_params.get('restart_file')
+stop_wall_time = run_params.getfloat('stop_wall_time')
+stop_sim_time = run_params.getfloat('stop_sim_time')
+stop_iteration = run_params.getint('stop_iteration')
+sim_dt = run_params.getfloat('dt')
+
+# Create bases and domain
+start_init_time = time.time()
+dealias = 3/2
+dtype = np.float64
+
+coords = d3.CartesianCoordinates('x', 'y', 'z')
+dist = d3.Distributor(coords, dtype=dtype, mesh=[2,2])
+xbasis = d3.RealFourier(coords['x'], size=nx, bounds=(0, Lx), dealias = dealias)
+ybasis = d3.RealFourier(coords['y'], size=ny, bounds=(0, Ly), dealias = dealias)
+zbasis = d3.ChebyshevT(coords['z'], size=nz, bounds = (-1,1), dealias = dealias)
+x = xbasis.local_grid(dealias)
+y = xbasis.local_grid(dealias)
+z = zbasis.local_grid(dealias)
+
+integ = lambda A: d3.Integrate(d3.Integrate(d3.Integrate(A, 'x'),'y'), 'z')
+
+# Fields
+ba = (xbasis,ybasis,zbasis)
+ba_p = (xbasis,ybasis)
+
+p = dist.Field(name='p', bases=ba)
+u = dist.VectorField(coords, name='u', bases=ba)
+tau_u1 = dist.VectorField(coords, name='tau_u1', bases=ba_p)
+tau_u2 = dist.VectorField(coords, name='tau_u2', bases=ba_p)
+tau_p = dist.Field(name='tau_p')
+# NCC
+U = dist.VectorField(coords, name='U', bases=(xbasis,ybasis,zbasis))
+U.change_scales(dealias)
+U['g'][0] = z
+
+ex = dist.VectorField(coords, name='ex')
+ey = dist.VectorField(coords, name='ey', bases=(zbasis,))
+ez = dist.VectorField(coords, name='ez')
+ex['g'][0] = 1
+ey['g'][1] = 1
+ez['g'][2] = 1
+
+lift_basis = zbasis.clone_with(a=1/2, b=1/2) # First derivative basis
+lift = lambda A: d3.Lift(A, lift_basis, -1)
+grad_u = d3.grad(u) + ez*lift(tau_u1) # First-order reduction
+
+if dist.comm.rank == 0:
+    if not datadir.exists():
+        datadir.mkdir()
+
+problem = d3.IVP([p, u, tau_u1, tau_u2, tau_p], namespace=locals())
+
+problem.add_equation("trace(grad_u) + tau_p = 0")
+problem.add_equation("dt(u) - div(grad_u)/Re + grad(p) + lift(tau_u2) + cross(ey,u)/Ro = -dot(u,grad(u))")
+problem.add_equation("dot(ex,u)(z=-1) = -1")
+problem.add_equation("dot(ex,u)(z=1) = 1")
+problem.add_equation("dot(ey,u)(z=-1) = 0")
+problem.add_equation("dot(ey,u)(z=1) = 0")
+problem.add_equation("dot(ez,u)(z=-1) = 0")
+problem.add_equation("dot(ez,u)(z=1) = 0")
+problem.add_equation("integ(p) = 0") # Pressure gauge
+
+solver = problem.build_solver(timestepper)
+logger.info("Solver built")
+
+solver.stop_sim_time = stop_sim_time
+solver.stop_wall_time = stop_wall_time
+solver.stop_iteration = stop_iteration
+
+# Initial conditions
+A = dist.VectorField(coords, name='A', bases=ba)
+A.change_scales(dealias)
+A.fill_random('g', seed=42, distribution='normal')
+A.low_pass_filter(scales=(0.5, 0.5, 0.5))
+A['g'] *= (Lz**2*(z+1)/Lz * (1 - (z+1)/Lz))**2 # Damp noise at walls
+
+up = d3.curl(A).evaluate()
+u.change_scales(dealias)
+# u['g'] = ampl*up['g']*Lz**2*(z+1)/Lz * (1 - (z+1)/Lz) + U['g']
+u['g'] = ampl*up['g'] + U['g']
+divu0 = d3.div(u).evaluate()
+logger.info("min, max divu = ({}, {})".format(divu0['g'].min(), divu0['g'].max()))
+
+KE = 0.5 * d3.DotProduct(u,u)
+KE.name = 'KE'
+u_pert = u - U
+KE_pert = 0.5 * d3.DotProduct(u_pert,u_pert)
+
+# Analysis
+check = solver.evaluator.add_file_handler(datadir / Path('checkpoints'), iter=10, max_writes=1, virtual_file=True)
+check.add_tasks(solver.state)
+check_c = solver.evaluator.add_file_handler(datadir / Path('checkpoints_c'),iter=1000,max_writes=100)
+check_c.add_tasks(solver.state, layout='c')
+# timeseries
+timeseries = solver.evaluator.add_file_handler(datadir / Path('timeseries'), iter=10)
+timeseries.add_task(integ(KE), name='KE')
+timeseries.add_task(integ(KE_pert), name = 'KE_pert')
+timeseries.add_task(integ(d3.div(u)*d3.div(u)), name='rms_div_u')
+# flow profiles
+flow = d3.GlobalFlowProperty(solver, cadence=10)
+flow.add_property(KE, name='KE')
+flow.add_property(d3.div(u), name='div_u')
+flow.add_property(d3.div(u)**2, name='div_u_sq')
+flow.add_property(KE_pert, name = 'KE_pert')
+# CFL
+CFL = d3.CFL(solver, initial_dt=1e-5, cadence=10, safety=0.2, threshold=0.1,
+             max_change=1.5, min_change=0.5, max_dt=sim_dt)
+CFL.add_velocity(u)
+# Main loop
+end_init_time = time.time()
+logger.info('Initialization time: %f' %(end_init_time-start_init_time))
+try:
+    logger.info('Starting loop')
+    while solver.proceed:
+        dt = CFL.compute_timestep()
+        solver.step(dt)
+        if (solver.iteration-1) % 10 == 0:
+            logger.info('Iteration: %i, Time: %e, dt: %e' %(solver.iteration, solver.sim_time, dt))
+            logger.info('Max KE = %e; Max div(u) = %e' %(flow.max('KE'), flow.max('div_u')))
+            logger.info('Vol RMS div(u) = %e'%flow.volume_integral('div_u_sq'))
+            logger.info('Max perturbation KE = %e' %flow.max('KE_pert'))
+except:
+    logger.error('Exception raised, triggering end of main loop.')
+    raise
+finally:
+    solver.evaluate_handlers_now(dt)
+    solver.log_stats()
