@@ -7,6 +7,8 @@ import numpy as np
 
 import dedalus.public as d3
 
+from GQLProjection import GQLProjection as Project
+
 logger = logging.getLogger(__name__)
 debug = False
 
@@ -31,6 +33,9 @@ Lz = 2 # fixed by problem definition
 
 ampl = params.getfloat('ampl')
 Re = params.getfloat('Re')
+Ro = params.getfloat('Ro')
+Lambda_x = params.getfloat('Lambda_x')
+Lambda_y = params.getfloat('Lambda_y')
 
 run_params = runconfig['run']
 restart = run_params.get('restart_file')
@@ -45,7 +50,7 @@ dealias = 3/2
 dtype = np.float64
 
 coords = d3.CartesianCoordinates('x', 'y', 'z')
-dist = d3.Distributor(coords, dtype=dtype, mesh=[4,4])
+dist = d3.Distributor(coords, dtype=dtype, mesh=[1,1])
 xbasis = d3.RealFourier(coords['x'], size=nx, bounds=(0, Lx), dealias = dealias)
 ybasis = d3.RealFourier(coords['y'], size=ny, bounds=(0, Ly), dealias = dealias)
 zbasis = d3.ChebyshevT(coords['z'], size=nz, bounds = (-1,1), dealias = dealias)
@@ -70,7 +75,7 @@ U.change_scales(dealias)
 U['g'][0] = z
 
 ex = dist.VectorField(coords, name='ex')
-ey = dist.VectorField(coords, name='ey')
+ey = dist.VectorField(coords, name='ey', bases=(zbasis,))
 ez = dist.VectorField(coords, name='ez')
 ex['g'][0] = 1
 ey['g'][1] = 1
@@ -85,9 +90,14 @@ if dist.comm.rank == 0:
         datadir.mkdir()
 
 problem = d3.IVP([p, u, tau_u1, tau_u2, tau_p], namespace=locals())
+Project_high = lambda A: Project(A,[Lambda_x,Lambda_y],'h')
+Project_low = lambda A: Project(A,[Lambda_x,Lambda_y],'l')
+ul = Project_low(u)
+uh = Project_high(u)
 
 problem.add_equation("trace(grad_u) + tau_p = 0")
-problem.add_equation("dt(u) - div(grad_u)/Re + grad(p) + lift(tau_u2) = -dot(u,grad(u))")
+#problem.add_equation("dt(u) - div(grad_u)/Re + grad(p) + lift(tau_u2) + cross(ey,u)/Ro = -dot(u,grad(u))")
+problem.add_equation("dt(u) - div(grad_u)/Re + grad(p) + lift(tau_u2)  = -Project_low(ul@grad(ul)) + uh@grad(uh)) - Project_high(ul@grad(uh) + uh@grad(ul)))")
 problem.add_equation("dot(ex,u)(z=-1) = -1")
 problem.add_equation("dot(ex,u)(z=1) = 1")
 problem.add_equation("dot(ey,u)(z=-1) = 0")
